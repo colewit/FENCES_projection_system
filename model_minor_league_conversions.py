@@ -4,13 +4,14 @@ import pickle
 import pandas as pd
 import numpy as np
 import warnings
+
 from sklearn.multioutput import MultiOutputRegressor # Wrapper for multi-output regression
-from xgboost import XGBRegressor # Gradient Boosting regressor
 from sklearn.model_selection import GridSearchCV, KFold
+from xgboost import XGBRegressor # Gradient Boosting regressor
 
 def get_minor_league_data(minor_league_df, major_league_df, shrinkage_PA=300, use_model=True,
                           target_cols=['wRC_plus', 'hit_rate', 'OBP', 'HR_rate', '2B_rate', 'SLG'],
-                          fit_model=False, model_path='minor_league_model.pkl', overwrite=False, minimum_pa=20):
+                          fit_model=False, model_path='models/minor_league_model.pkl', overwrite=False, minimum_pa=20):
     """
     Loads, processes, and potentially models minor league data to estimate MLB equivalent stats.
 
@@ -49,8 +50,16 @@ def get_minor_league_data(minor_league_df, major_league_df, shrinkage_PA=300, us
                                                    target_cols=target_cols,
                                                    fit_model=fit_model, model_path=model_path, overwrite=overwrite)
         # Select necessary columns from the modeled output for aggregation
-        cols_to_aggregate = [col for col in modeled_data.columns if 'pred_' in col] + ['PA', 'AB', 'Age', 'Name', 'Season', 'IDfg']
+        
+        prospect_cols =['current_hit', 'future_hit',
+                        'current_game_power', 'future_game_power', 'current_raw_power',
+                        'future_raw_power', 'current_speed', 'future_speed', 'prospect_rank']
+        
+        modeled_data['Spd'] = modeled_data.Spd_AA.fillna(0) + modeled_data.Spd_AAA.fillna(0)
+        cols_to_aggregate = [col for col in modeled_data.columns if 'pred_' in col] + \
+            ['PA', 'AB', 'SB','Spd','CS', 'Age', 'Name', 'Season', 'IDfg'] + prospect_cols
         amdf_raw = modeled_data[cols_to_aggregate].copy()
+
 
     else:
         print("Using aggregate factors for minor league conversions.")
@@ -69,11 +78,15 @@ def get_minor_league_data(minor_league_df, major_league_df, shrinkage_PA=300, us
         minor_league_df['age_factor'] = (.97) ** (minor_league_df.Age_for_level + 4) # Example adjustment
         minor_league_df['pred_wRC_plus'] = (minor_league_df['wRC_plus_adjusted'] * minor_league_df['age_factor'])
 
-        # Optional: Apply shrinkage towards league average (commented out)
-        # amdf['pred_wRC_plus'] = (amdf.factor*100 * (shrinkage_PA-amdf.PA).clip(0,shrinkage_PA) + (amdf.PA).clip(0,shrinkage_PA) * amdf['pred_wRC_plus'])/shrinkage_PA
-
+        prospect_cols =['current_hit', 'future_hit',
+                        'current_game_power', 'future_game_power', 'current_raw_power',
+                        'future_raw_power', 'current_speed', 'future_speed', 'prospect_rank']
         # Keep only necessary columns for aggregation
-        cols_to_aggregate = ['pred_wRC_plus', 'PA', 'AB', 'Age', 'Name', 'Season', 'IDfg'] # Simplified for non-model path
+        cols_to_aggregate = ['pred_wRC_plus', 'PA', 'AB', 'SB','Spd','CS', 'Age', 'Name', 'Season', 'IDfg'] + prospect_cols
+        
+        minor_league_df['SB'] = minor_league_df.SB_AA.fillna(0) + minor_league_df.SB_AAA.fillna(0)
+        minor_league_df['CS'] = minor_league_df.CS_AA.fillna(0) + minor_league_df.CS_AAA.fillna(0)
+        minor_league_df['Spd'] = minor_league_df.Spd_AA.fillna(0) + minor_league_df.Spd_AAA.fillna(0)
         amdf_raw = minor_league_df[cols_to_aggregate].copy()
 
 
@@ -83,8 +96,15 @@ def get_minor_league_data(minor_league_df, major_league_df, shrinkage_PA=300, us
 
     pred_cols = [col for col in amdf_raw.columns if 'pred_' in col] # Identify prediction columns
     agg_dict = {col: wm for col in pred_cols} # Apply weighted mean to prediction cols
+    
+    for col in prospect_cols:
+        agg_dict[col]='first'
+    
     agg_dict['PA'] = 'sum'
     agg_dict['AB'] = 'sum'
+    agg_dict['CS'] = 'sum'
+    agg_dict['SB'] = 'sum'
+    agg_dict['Spd'] = 'sum'
     agg_dict['Age'] = 'first' # Keep age from the first record (usually highest level due to typical processing order)
 
     # Group by player and season, aggregate stats
@@ -92,7 +112,6 @@ def get_minor_league_data(minor_league_df, major_league_df, shrinkage_PA=300, us
 
     print("Minor league data processing finished.")
     return amdf
-
 
 def agg_minor_league_conversions(minor_league_df, major_league_df, minimum_pa=100):
     """
@@ -142,8 +161,8 @@ def agg_minor_league_conversions(minor_league_df, major_league_df, minimum_pa=10
     # Calculate the average AAA->MLB factor first
     avg_aaa_factor = agg_conversion_data[agg_conversion_data.Level == 'AAA']['factor'].mean()
     if pd.isna(avg_aaa_factor):
-         warnings.warn("Could not calculate average AAA->MLB factor. AA factors might be inaccurate.")
-         avg_aaa_factor = 1.0 # Default to 1 if calculation fails
+        warnings.warn("Could not calculate average AAA->MLB factor. AA factors might be inaccurate.")
+        avg_aaa_factor = 1.0 # Default to 1 if calculation fails
 
     # Apply the chaining for AA levels
     agg_conversion_data['factor'] = np.where(
@@ -200,7 +219,9 @@ def fit_minor_league_model(X_train, Y_train, n_splits=3, learning_rates=[0.01, 0
     return best_model
 
 
-def prepare_data_for_minor_league_model(minor_league_df, major_league_df,minimum_pa=400,  target_cols=['wRC_plus', 'hit_rate', 'OBP', 'HR_rate', '2B_rate', 'SLG']):
+def prepare_data_for_minor_league_model(minor_league_df, major_league_df,minimum_pa=400,  
+                                        target_cols=['wRC_plus', 'hit_rate', 'OBP', 'HR_rate', '2B_rate', 'SLG']):
+    
     minor_league_df = minor_league_df.copy().rename(columns={'PlayerId': 'IDfg'})
     major_league_df = major_league_df.copy()
 
@@ -282,7 +303,8 @@ def prepare_data_for_minor_league_model(minor_league_df, major_league_df,minimum
     next_mlb_stats['Season'] -= 1 # Shift season back to merge with previous MiLB season
 
     # Merge next season's MLB stats
-    rows_needing_next_season = rows_needing_next_season.drop(columns=promotion_cols + ['max_PA'], errors='ignore') # Drop previous merge attempts, ignore errors if columns don't exist
+    # Drop previous merge attempts, ignore errors if columns don't exist
+    rows_needing_next_season = rows_needing_next_season.drop(columns=promotion_cols + ['max_PA'], errors='ignore') 
     rows_needing_next_season = rows_needing_next_season.merge(next_mlb_stats, how='left', on=['IDfg', 'Season'])
 
     # Combine data with same-season targets and next-season targets
@@ -329,17 +351,18 @@ def prepare_data_for_minor_league_model(minor_league_df, major_league_df,minimum
     promotion_data['wRC_plus_regressed'] = (promotion_data.remaining_PA_sqrt * 100 + promotion_data['wRC_plus'].fillna(100) * promotion_data.taken_PA_sqrt) / total_pa_sqrt
 
     # Merge Prospect Report Data
-    try:
-        prospect_report = pd.read_csv('prospect_report_data.csv').drop(columns='Unnamed: 0', errors='ignore')
-        promotion_data = promotion_data.merge(prospect_report, how='left', on=['Name', 'Season'])
-        # Handle missing prospect ranks, especially for older seasons
-        promotion_data['prospect_rank'] = np.where(promotion_data.Season >= 2018, promotion_data.prospect_rank.fillna(-1), promotion_data.prospect_rank) # Fill recent NaNs
-        prospect_cols = [x for x in prospect_report.columns if x not in ['Name', 'Season']]
-    except FileNotFoundError:
-        warnings.warn("Prospect report data not found. Proceeding without prospect features.")
-        prospect_cols = []
-        # Add placeholder columns if needed downstream
-        promotion_data['prospect_rank'] = np.nan
+    prospect_report = pd.read_csv('data/prospect_report_data.csv').drop(columns='Unnamed: 0', errors='ignore')
+    promotion_data = promotion_data.merge(prospect_report, how='left', on=['Name', 'Season']).sort_values('Season')
+    
+    prospect_cols = [x for x in prospect_report.columns if x not in ['Name', 'Season']]
+    for col in prospect_cols:
+        promotion_data[col] = promotion_data.groupby('IDfg')[col].transform(lambda x: x.ffill())
+        
+    # Handle missing prospect ranks, especially for older seasons
+    promotion_data['prospect_rank'] = np.where(promotion_data.Season >= 2018,
+                                               promotion_data.prospect_rank.fillna(-1),
+                                               promotion_data.prospect_rank) # Fill recent NaNs
+
 
     # Define final feature set for the model
     final_feature_cols = ['Level', 'Age', 'wRC_plus_regressed'] + \
@@ -377,158 +400,6 @@ def model_minor_league_conversions(minor_league_df, major_league_df, minimum_pa=
     """
     print("Modeling minor league conversions...")
 
-    '''
-    # --- Step 1: Feature Engineering ---
-    minor_league_df = minor_league_df.copy()
-    major_league_df = major_league_df.copy()
-
-    # Age relative to level average
-    minor_league_df['Age_for_level'] = minor_league_df.Age - minor_league_df.groupby('Level').Age.transform('mean')
-    # Years spent at the current level
-    minor_league_df['years_at_level'] = minor_league_df.groupby(['IDfg', 'Level']).Age.transform(lambda x: range(1, len(x) + 1))
-
-    # Ensure consistent ID types
-    minor_league_df['IDfg'] = minor_league_df.IDfg.astype(str)
-    major_league_df['IDfg'] = major_league_df.IDfg.astype(str)
-
-    # Define feature columns (ensure these exist in minor_league_df)
-    base_feature_cols = ['PA', 'HR_rate', '2B_rate', 'BB%', 'K%', 'BB/K', 'AVG', 'BABIP',
-                         'OBP', 'SLG', 'OPS', 'ISO', 'Age_for_level', 'wRC_plus', 'hit_rate',
-                         'years_at_level', 'Spd']
-
-    feature_cols = [col for col in base_feature_cols if col in minor_league_df.columns]
-    missing_base_cols = set(base_feature_cols) - set(feature_cols)
-    if missing_base_cols:
-        warnings.warn(f"Missing base feature columns in minor league data: {missing_base_cols}")
-
-
-    # --- Step 2: Prepare AA and AAA Data ---
-    AAA = minor_league_df[minor_league_df.Level == 'AAA'].copy()
-    AA = minor_league_df[minor_league_df.Level == 'AA'].copy()
-
-    # Combine AA and AAA stats for the same player/season
-    # Use outer merge to keep players who only played at one level
-    promotion_data = AAA.merge(AA[['Season', 'IDfg', 'Name', 'Age'] + feature_cols],
-                               how='outer', on=['Season', 'IDfg', 'Name', 'Age'],
-                               suffixes=['_AAA', '_AA'])
-    # Assign 'Level' based on which data was present (prefer AAA if both)
-    promotion_data['Level'] = np.where(promotion_data['PA_AAA'].notna(), 'AAA', 'AA')
-
-    # --- Step 3: Prepare Target MLB Data ---
-    mlb_stats = major_league_df.sort_values('Season').copy()
-    # Calculate rolling PA sum over current and previous season (if available)
-    mlb_stats['rolling_PA'] = mlb_stats.groupby('IDfg').PA.transform(lambda x: x.rolling(window=2, min_periods=1).sum())
-
-    # Calculate rolling weighted average for target stats, weighted by PA
-    for col in target_cols:
-        if col not in mlb_stats.columns:
-            warnings.warn(f"Target column '{col}' not found in major_league_df. Skipping.")
-            target_cols.remove(col) # Remove from list if not found
-            continue
-        mlb_stats[f'PA_x_{col}'] = mlb_stats['PA'] * mlb_stats[col]
-        mlb_stats[f'rolling_PA_x_{col}'] = mlb_stats.groupby('IDfg')[f'PA_x_{col}'].transform(lambda x: x.rolling(window=2, min_periods=1).sum())
-        # Use rolling average only if total PA in window is below threshold
-        mlb_stats[col] = np.where(mlb_stats['rolling_PA'] < minimum_pa,
-                                  mlb_stats[f'rolling_PA_x_{col}'] / mlb_stats['rolling_PA'].replace(0, np.nan), # Avoid division by zero
-                                  mlb_stats[col])
-
-    # Determine max reliable PA achieved by player
-    mlb_stats['max_PA'] = mlb_stats.groupby('IDfg').rolling_PA.transform('max')
-    # Mark stats as unreliable (NaN) if player never reached minimum_pa threshold in a 2-year window
-    for col in target_cols:
-        if col in mlb_stats.columns: # Check if column exists
-            mlb_stats[col] = np.where(mlb_stats['max_PA'] >= minimum_pa, mlb_stats[col], np.nan)
-
-    mlb_stats = mlb_stats[['IDfg', 'Season', 'max_PA'] + target_cols].copy()
-    # Rename target columns for merging
-    mlb_stats = mlb_stats.rename(columns={col: f'promotion_{col}' for col in target_cols})
-    promotion_cols = [f'promotion_{col}' for col in target_cols] # List of renamed target columns
-
-    # --- Step 4: Merge Target Data (Same Season) ---
-    promotion_data = promotion_data.merge(mlb_stats.drop(columns='max_PA'), how='left', on=['IDfg', 'Season'])
-    # Merge max_PA separately to keep it for filtering later
-    promotion_data = promotion_data.merge(mlb_stats[['IDfg',  'max_PA']].drop_duplicates(), how='left', on=['IDfg']) # Merge max_PA based on season too
-
-
-    # --- Step 5: Handle Next-Season Promotions ---
-    # Identify rows where same-season MLB data was missing or insufficient
-    rows_needing_next_season = promotion_data[promotion_data[promotion_cols].isna().any(axis=1)].copy()
-    rows_with_this_season = promotion_data[promotion_data[promotion_cols].notna().all(axis=1)].copy()
-
-    # Prepare next season's MLB stats
-    next_mlb_stats = mlb_stats.copy()
-    next_mlb_stats['Season'] -= 1 # Shift season back to merge with previous MiLB season
-
-    # Merge next season's MLB stats
-    rows_needing_next_season = rows_needing_next_season.drop(columns=promotion_cols + ['max_PA'], errors='ignore') # Drop previous merge attempts, ignore errors if columns don't exist
-    rows_needing_next_season = rows_needing_next_season.merge(next_mlb_stats, how='left', on=['IDfg', 'Season'])
-
-    # Combine data with same-season targets and next-season targets
-    promotion_data = pd.concat([rows_with_this_season, rows_needing_next_season], ignore_index=True)
-
-
-    # --- Step 6: Impute Targets for Players Never Reaching Majors ---
-    promotion_data['max_PA'] = promotion_data['max_PA'].fillna(0)
-    # Identify players unlikely to have reached the majors reliably
-    promotion_data['never_made_majors'] = (promotion_data['Season'] < 2022) & (promotion_data['max_PA'] < minimum_pa) # Use min_pa threshold
-
-    # Impute with 20th percentile of reliable MLB players for those who likely didn't make it
-    reliable_targets = promotion_data[~promotion_data['never_made_majors']][promotion_cols]
-
-    quantile_vals = reliable_targets.quantile(0.2)
-    for col in promotion_cols:
-        if col in promotion_data.columns: # Check existence
-            q_val = quantile_vals.get(col, np.nan) # Use .get for safety
-            if not pd.isna(q_val):
-                promotion_data.loc[promotion_data['never_made_majors'], col] = promotion_data.loc[promotion_data['never_made_majors'], col].fillna(q_val)
-
-
-    # Drop rows where target is still NaN after imputation attempts
-    # promotion_data = promotion_data.dropna(subset=promotion_cols) # Keep rows even if target is missing for prediction? Or drop?
-
-    # --- Step 7: Final Feature Engineering & Prospect Ranks ---
-    # Combine AA/AAA stats with weighted average (example for wRC+)
-    promotion_data['PA'] = promotion_data.PA_AA.fillna(0) + promotion_data.PA_AAA.fillna(0)
-    # Ensure PA_AAA and PA_AA exist before using them as weights
-    pa_aaa = promotion_data.get('PA_AAA', pd.Series(0, index=promotion_data.index)).fillna(0)
-    pa_aa = promotion_data.get('PA_AA', pd.Series(0, index=promotion_data.index)).fillna(0)
-    total_pa = (pa_aaa + pa_aa).replace(0, np.nan) # Avoid division by zero
-
-    wrc_aaa = promotion_data.get('wRC_plus_AAA', pd.Series(np.nan, index=promotion_data.index)).fillna(0)
-    wrc_aa = promotion_data.get('wRC_plus_AA', pd.Series(np.nan, index=promotion_data.index)).fillna(0)
-
-    # Apply league adjustment (e.g., 0.85 for AA relative to AAA) - Make this configurable/empirical
-    promotion_data['wRC_plus'] = (wrc_aaa * pa_aaa + 0.85 * wrc_aa * pa_aa) / total_pa
-
-    # Regress towards 100 wRC+ based on PA (sqrt weighting)
-    promotion_data['remaining_PA_sqrt'] = np.sqrt((600 - promotion_data.PA).clip(0, 600))
-    promotion_data['taken_PA_sqrt'] = np.sqrt(promotion_data.PA.clip(0, 600))
-    total_pa_sqrt = (promotion_data.remaining_PA_sqrt + promotion_data.taken_PA_sqrt).replace(0, np.nan)
-    promotion_data['wRC_plus_regressed'] = (promotion_data.remaining_PA_sqrt * 100 + promotion_data['wRC_plus'].fillna(100) * promotion_data.taken_PA_sqrt) / total_pa_sqrt
-
-    # Merge Prospect Report Data
-    try:
-        prospect_report = pd.read_csv('prospect_report_data.csv').drop(columns='Unnamed: 0', errors='ignore')
-        promotion_data = promotion_data.merge(prospect_report, how='left', on=['Name', 'Season'])
-        # Handle missing prospect ranks, especially for older seasons
-        promotion_data['prospect_rank'] = np.where(promotion_data.Season >= 2018, promotion_data.prospect_rank.fillna(-1), promotion_data.prospect_rank) # Fill recent NaNs
-        prospect_cols = [x for x in prospect_report.columns if x not in ['Name', 'Season']]
-    except FileNotFoundError:
-        warnings.warn("Prospect report data not found. Proceeding without prospect features.")
-        prospect_cols = []
-        # Add placeholder columns if needed downstream
-        promotion_data['prospect_rank'] = np.nan
-
-    # Define final feature set for the model
-    final_feature_cols = ['Level', 'Age', 'wRC_plus_regressed'] + \
-                         [f'{col}_AAA' for col in feature_cols if f'{col}_AAA' in promotion_data.columns] + \
-                         [f'{col}_AA' for col in feature_cols if f'{col}_AA' in promotion_data.columns] + \
-                         prospect_cols
-    # Ensure columns actually exist in the dataframe
-    final_feature_cols = [col for col in final_feature_cols if col in promotion_data.columns]
-
-
-    '''
 
     promotion_data, final_feature_cols, promotion_cols = prepare_data_for_minor_league_model(minor_league_df, 
                                                                              major_league_df,minimum_pa=minimum_pa,  
@@ -550,22 +421,7 @@ def model_minor_league_conversions(minor_league_df, major_league_df, minimum_pa=
         X_train_cols = X_train.columns.tolist() # Save training columns
 
         model = fit_minor_league_model(X_train, Y_train)
-        '''
-        # Define the XGBoost model within MultiOutputRegressor
-        model = MultiOutputRegressor(
-            XGBRegressor(
-                n_estimators=100,
-                learning_rate=0.03,
-                max_depth=4,
-                verbosity=0, # Quieter output
-                n_jobs=-1,   # Use all available CPU cores
-                random_state=42,
-                # enable_categorical=True # May need specific handling or upstream encoding
-            )
 
-        )
-        '''
-        
         print("Model training complete.")
 
         # Save the trained model
@@ -613,6 +469,7 @@ def model_minor_league_conversions(minor_league_df, major_league_df, minimum_pa=
     promotion_data['pred_AVG'] = (promotion_data.pred_hit_rate * promotion_data.PA / promotion_data.AB.replace(0,np.nan)).fillna(0) # Avoid div by zero
 
 
+    print(promotion_data.columns)
     print("Minor league conversion modeling finished.")
     # Return only essential columns + predictions
     return promotion_data
@@ -622,13 +479,13 @@ if __name__ == '__main__':
 
     RUN_NAME = 'test'
     TRAIN_SEASON_CUTOFF = 2019
-    MODEL_PATH = f"minor_league_model_{RUN_NAME}.pkl"
+    MODEL_PATH = f"models/minor_league_model_{RUN_NAME}.pkl"
     major_league_df = pd.read_csv('../data.csv').rename(columns={'wRC+':'wRC_plus'})
     major_league_df['HR_rate'] = major_league_df.HR/major_league_df.PA
     major_league_df['2B_rate'] = major_league_df['2B']/major_league_df.PA
     major_league_df['hit_rate'] = (major_league_df['1B']+major_league_df['3B']+major_league_df['2B']+major_league_df['HR'])/major_league_df.PA
     
-    minor_league_df = pd.read_csv('minor_league_data.csv')
+    minor_league_df = pd.read_csv('data/minor_league_data.csv')
 
     promotion_data, final_feature_cols, promotion_cols = prepare_data_for_minor_league_model(minor_league_df, 
                                                                              major_league_df,
