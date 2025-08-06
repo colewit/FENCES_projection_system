@@ -77,13 +77,13 @@ def get_soft_bucket_error(adf):
     rmse = np.mean((buckets-.1)**2)**.5
     return rmse
 
-def evaluate_player(data, name, start_season, n_seasons_forward, weights, tau=0.10, predict_delta = True, sim_num = 0):
+def evaluate_player(data, idfg, start_season, n_seasons_forward, weights, tau=0.10, predict_delta = True, sim_num = 0):
     
     target_columns = ['K%','BB%','1B%','2B%','3B%','HR%','out%', 'xwOBA']
     delta_target_columns = [f'delta_{column}' for column in target_columns]
     
     latent_columns = ['K%','chase_value', 'mab_launch_speed', 'mab_launch_angle', 
-                      'mab_woba', 'BB%', 'Barrel%', 'whiff', 'xwOBA']
+                      'mab_woba', 'BB%', 'Barrel%', 'whiff', 'xwOBA','single_proba','double_proba', 'triple_proba','home_run_proba']
     
     latent_next_columns = [f'{col}_next' for col in latent_columns]
     #['xBA','xSLG','EV', 'PA', 'wRC_plus']
@@ -115,15 +115,15 @@ def evaluate_player(data, name, start_season, n_seasons_forward, weights, tau=0.
     cdf_roll = cdf_roll.dropna(subset=['xwOBA'])
     
     pdf = (
-        cdf[(cdf.Name == name) & (cdf.Season.between(start_season - n_season_window + 1, start_season))]
+        cdf[(cdf.IDfg == idfg) & (cdf.Season.between(start_season - n_season_window + 1, start_season))]
         .sort_values('Season', ascending=False)
         .reset_index(drop=True)
     )
     
     for season in range(start_season, start_season+n_seasons_forward, 1):
     
-        all_neighbors = find_nearest_neighbors(pdf, cdf, name, season, pca_columns, 400, 3, weights, tau, 'exp',10)
-        all_neighbors = all_neighbors[['Name','Season', 'PA_next', 'PA', 'neighbor_w'] +\
+        all_neighbors = find_nearest_neighbors(pdf, cdf, idfg, season, pca_columns, 400, 3, weights, tau, 'exp',10)
+        all_neighbors = all_neighbors[['Name', 'IDfg', 'Season', 'PA_next', 'PA', 'neighbor_w'] +\
                                       list(set(latent_columns + latent_next_columns + target_columns)) ]
         
 
@@ -159,14 +159,15 @@ def evaluate_player(data, name, start_season, n_seasons_forward, weights, tau=0.
             feature_columns = d['feature_columns']
 
         xgb_columns = latent_columns
-        samples = invert_skewnorm_joint_samples_individual(all_params, u_samples, latent_columns)
-        output_df = predict_xgb(samples, xgb, feature_columns, output_columns)
+        output_df = invert_skewnorm_joint_samples_individual(all_params, u_samples, latent_columns)
+        #output_df = predict_xgb(samples, xgb, feature_columns, output_columns)
 
         last_row = pdf[pdf.Season == pdf.Season.max()][['Season', 'IDfg', 'Name', 'Age']]
     
         sample_row = output_df.sample(1)
         sample_row['Age'] = last_row['Age'].iloc[0] + 1
         sample_row['Season'] = last_row['Season'].iloc[0] + 1
+        sample_row['IDfg'] = last_row['IDfg'].iloc[0]
         
         sample_row['PA'] = np.random.normal(500, 75) if sample_row.xwOBA.iloc[0] > .320 else np.random.normal(400, 75)
         
@@ -186,7 +187,6 @@ def evaluate_player(data, name, start_season, n_seasons_forward, weights, tau=0.
         pdf.drop(columns = [x for x in z_scales.columns if x != 'Season'], inplace=True)
         
     pdf['sim']=sim_num
-    #TODO here
     return pdf
 
 if __name__ == '__main__':
@@ -196,16 +196,20 @@ if __name__ == '__main__':
     name = 'Elly De La Cruz'
     n_sims = 10
     
+    
+    season = 2024
+    n_seasons_forward = 3
+    
     target_columns = ['K%','BB%','1B%','2B%','3B%','HR%','out%', 'xwOBA']
     
     latent_columns = ['K%','chase_value', 'mab_launch_speed', 'mab_launch_angle', 
-                      'mab_woba', 'BB%', 'Barrel%', 'whiff', 'xwOBA']
+                      'mab_woba', 'BB%', 'Barrel%', 'whiff', 'xwOBA','single_proba','double_proba', 'triple_proba','home_run_proba']
     
     data = preprocess(latent_columns, target_columns)
+    idfg = data[data.Name==name].IDfg.iloc[0]
     
-
     results = Parallel(n_jobs=-1)(
-        delayed(evaluate_player)(data.copy(deep=True), name, 2024, 3, [.72, .14, .14], 16, False, i)
+        delayed(evaluate_player)(data.copy(deep=True), idfg, season, n_seasons_forward, [.72, .14, .14], 16, False, i)
         for i in range(n_sims)
     )
 

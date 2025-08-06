@@ -8,11 +8,10 @@ from sklearn.preprocessing import StandardScaler
 import warnings
 
 NA_FILLS_DEFAULT = {
-    'xwOBA': -2, 'Barrel%': -1,
-    'BB%': -1, 'K%': 1, 'PA': -2,
-    'mab_launch_speed':-1, 'chase_value':-1, 'mab_launch_angle':0, 'mab_woba':-2,
-    'whiff':-1
-}
+        'PA': -2, 'xwOBA': -2, 'Barrel%': -1, 'BB%': -1, 'K%': 1, 
+        'mab_launch_speed':-1, 'chase_value':-1, 'mab_launch_angle':0, 'mab_woba':-1,
+        'whiff':-1, 'home_run_proba':-1, 'double_proba':-1, 'single_proba':-1, 'triple_proba':0
+    }
     
 def build_rolling_windows(df, columns, n_seasons=3):
     df = df.sort_values(['IDfg', 'Season'])
@@ -36,6 +35,7 @@ def preprocess(latent_columns, target_columns):
     data = data[data.Level=='MLB']
     
     df=pd.read_csv('fences/batter_qualities.csv')
+    
 
     df = df.sort_values('Season')
     df['IDfg'] = df['IDfg'].astype(str)
@@ -46,12 +46,14 @@ def preprocess(latent_columns, target_columns):
     data = data.merge(df[['Season', 'num_swings', 'IDfg']+selected_columns], how = 'left', on = ['IDfg','Season'])
 
 
+    data['in_play%'] = 1 - data['K%'] - data['BB%']
+    for col in ['home_run_proba','single_proba','triple_proba','double_proba']:
+        data[col] *= data['in_play%']
+        
+        
     data = data.sort_values('Season')
-    data['whiff_next'] = data.groupby(['IDfg']).whiff.transform(lambda x: x.shift(-1))
-    data['Barrel%_next'] = data.groupby(['IDfg'])['Barrel%'].transform(lambda x: x.shift(-1))
-    data['BB%_next'] = data.groupby(['IDfg'])['BB%'].transform(lambda x: x.shift(-1))
-    data['K%_next'] = data.groupby(['IDfg'])['K%'].transform(lambda x: x.shift(-1))
-    data['xwOBA_next'] = data.groupby(['IDfg'])['xwOBA'].transform(lambda x: x.shift(-1))
+    for col in ['whiff','Barrel%','BB%','K%','xwOBA', 'home_run_proba','single_proba','triple_proba','double_proba']:
+        data[f'{col}_next'] = data.groupby(['IDfg'])[col].transform(lambda x: x.shift(-1))
 
     data['1B%'] = data['1B']/data.PA
     data['2B%'] = data['2B']/data.PA
@@ -66,7 +68,7 @@ def preprocess(latent_columns, target_columns):
     return data
 
 def find_nearest_neighbors(
-    pdf, cdf, name, season, columns,
+    pdf, cdf, idfg, season, columns,
     n_neighbors=None, n_seasons=3,
     weights=None, tau=0.1, kernel_kind="exp",
     noisy_neighbor_cutoff = None, na_fills = NA_FILLS_DEFAULT
@@ -81,7 +83,9 @@ def find_nearest_neighbors(
         .sort_values('Season', ascending=False)
         .reset_index(drop=True)
     )
-        
+    
+    name = pdf.Name.iloc[0]
+    
     num_seasons_observed = pdf.shape[0]
 
     # Filter candidate df, drop rows missing key targets, restrict age window
@@ -97,9 +101,6 @@ def find_nearest_neighbors(
     cdf_roll = cdf_roll[cdf_roll.Age.between(age_max - 3, age_max + 3)].copy()
 
     # Predefine fills for missing data (only used during scaling)
-    
-    #'xBA': -1, 'xSLG': -1, 
-
     cdf_roll['DistanceToTarget'] = 0.0
 
     # Create a container for storing feature distances and weights
@@ -157,7 +158,7 @@ def find_nearest_neighbors(
         cdf_roll['DistanceToTarget'] += distances
 
     # Drop self-comparisons
-    cdf_roll = cdf_roll[~np.logical_and(cdf_roll.Name == name, cdf_roll.Season == season)]
+    cdf_roll = cdf_roll[~np.logical_and(cdf_roll.IDfg == idfg, cdf_roll.Season == season)]
 
     PA = pdf.iloc[0].PA
     #tau = tau * (np.sqrt(600)/np.sqrt(PA)).clip(1)
@@ -176,6 +177,7 @@ def find_nearest_neighbors(
     # Add metadata
     cdf_roll['comparison_season'] = season
     cdf_roll['comparison_player'] = name
+    cdf_roll['comparison_IDfg'] = idfg
 
     return cdf_roll
 
@@ -252,7 +254,7 @@ def invert_skewnorm_joint_samples(df, u_samples, columns):
             pdf[col] = row[col] + pdf[f'delta_{col}_forward']
         
         pdf['Name'] = row.Name
-        #pdf['IDfg'] = row.IDfg
+        pdf['IDfg'] = row.IDfg
         pdf['Season'] = row.Season
         l.append(pdf)
     return pd.concat(l)
@@ -271,7 +273,7 @@ def invert_skewnorm_joint_samples_individual(row, u_samples, columns):
         pdf[col] = row[col] + pdf[f'delta_{col}_forward']
 
     pdf['Name'] = row.Name
-    #pdf['IDfg'] = row.IDfg
+    pdf['IDfg'] = row.IDfg
     pdf['Season'] = row.Season
     return pdf
 
@@ -282,6 +284,6 @@ def predict_xgb(data, xgb, input_columns, output_columns):
 
 
     # TODO here
-    adf = pd.concat([data[['Name','Season']+input_columns].reset_index(drop=True),
+    adf = pd.concat([data[['Name','Season', 'IDfg']+input_columns].reset_index(drop=True),
            pd.DataFrame(raw_preds, columns = [f'projected_{col}' for col in output_columns]).reset_index(drop=True)], axis = 1)
     return adf

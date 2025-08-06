@@ -27,26 +27,25 @@ and overshoots homeruns for guys who do not homer
 '''
 
 def find_nearest_neighbors_wrapper(
-    cdf, name, season, columns,
+    cdf, idfg, season, columns,
     n_neighbors=None, n_seasons=3,
     weights=None, tau=0.1, kernel_kind="exp",
     noisy_neighbor_cutoff = None
 ):
     
     na_fills = {
-        'xwOBA': -1, 'xBA': -1, 'xSLG': -1, 'EV': -1, 'Barrel%': -1,
-        'BB%': -1, 'K%': 1, 'wRC_plus': -1, 'PA': -2,
-        'mab_launch_speed':-1, 'chase_value':-1, 'mab_launch_angle':0, 'mab_woba':-2,
-        'whiff':-1
+        'PA': -2, 'wRC_plus': -2, 'xwOBA': -2, 'Barrel%': -1, 'BB%': -1, 'K%': 1, 
+        'mab_launch_speed':-1, 'chase_value':-1, 'mab_launch_angle':0, 'mab_woba':-1,
+        'whiff':-1, 'home_run_proba':-1, 'double_proba':-1, 'single_proba':-1, 'triple_proba':0
     }
     
     pdf = (
-        cdf[(cdf.Name == name) & (cdf.Season.between(season - n_seasons + 1, season))]
+        cdf[(cdf.IDfg == idfg) & (cdf.Season.between(season - n_seasons + 1, season))]
         .sort_values('Season', ascending=False)
         .reset_index(drop=True)
     )
     
-    return find_nearest_neighbors(pdf, cdf, name, season, columns, n_neighbors, n_seasons, 
+    return find_nearest_neighbors(pdf, cdf, idfg, season, columns, n_neighbors, n_seasons, 
                            weights, tau, kernel_kind, noisy_neighbor_cutoff, na_fills)
     
 
@@ -57,11 +56,13 @@ def project_batters(season, weights, n_neighbors=400, n_seaon_lookback=3, tau=0.
     target_columns = ['K%','BB%','1B%','2B%','3B%','HR%','out%', 'xwOBA']
     delta_target_columns = [f'delta_{column}' for column in target_columns]
     
+    # TODO convert probas from BB rate to rate per PA, and instead of xgboost to predict go from probas
+    # tenatively done ^^
     latent_columns = ['K%','chase_value', 'mab_launch_speed', 'mab_launch_angle', 
-                      'mab_woba', 'BB%', 'Barrel%', 'whiff', 'xwOBA']
+                      'mab_woba', 'BB%', 'Barrel%', 'whiff', 'xwOBA','single_proba','double_proba', 'triple_proba','home_run_proba']
     
     latent_next_columns = [f'{col}_next' for col in latent_columns]
-    pca_columns = list(set(latent_columns + ['xBA','xSLG','EV', 'PA', 'wRC_plus']))
+    pca_columns = list(set(latent_columns + ['PA', 'wRC_plus']))
     
     data = preprocess(latent_columns, target_columns)
     cdf = data[['Season','IDfg','Name','Age', 'wRC_plus_next', 'rolled_wRC_plus','PA_next'] \
@@ -70,53 +71,53 @@ def project_batters(season, weights, n_neighbors=400, n_seaon_lookback=3, tau=0.
     cdf[[x+'_z_score' for x in pca_columns]] = cdf.groupby('Season')[pca_columns]\
         .transform(lambda x: (x - x.mean()) / (x.std() + 1e-6))
 
+    #TODO make PA a config
+    PA_min_cutoff = 200
+    
     cdf = cdf[cdf.Season >= 2015]
-    names = cdf[np.logical_and(cdf.PA>200,cdf.Season == season)].Name.unique()
+    names = cdf[np.logical_and(cdf.PA>PA_min_cutoff,cdf.Season == season)].Name.unique()
 
     cdf_roll = build_rolling_windows(cdf, pca_columns, n_seasons=3)
-    cdf_roll = cdf_roll.dropna(subset=['xBA'])
+    cdf_roll = cdf_roll.dropna(subset=['xwOBA'])
     
-    combos = cdf_roll[cdf_roll.Season == season][['Name','Season']].values
+    combos = cdf_roll[cdf_roll.Season == season][['IDfg','Season']].values
     
 
     
     
     results = Parallel(n_jobs=-1)(
-        delayed(find_nearest_neighbors_wrapper)(cdf, name, season,
+        delayed(find_nearest_neighbors_wrapper)(cdf, idfg, season,
                                                 pca_columns, n_neighbors, n_seaon_lookback,
                                                 weights, tau, 'exp',noisy_neighbor_cutoff)
-        for name, season in combos[:5]
+        for idfg, season in combos
     )
     '''
     
     for name, season in combos[:3]:
     
-        find_nearest_neighbors(cdf, name, season, pca_columns, 400, 3, weights, tau, 'exp',10)
+        find_nearest_neighbors(cdf, idfg, season, pca_columns, 400, 3, weights, tau, 'exp',10)
     '''
     
     all_neighbors = pd.concat(results)
-    all_neighbors = all_neighbors[all_neighbors.PA_next > 200]
+    all_neighbors = all_neighbors[all_neighbors.PA_next > PA_min_cutoff]
     
-    #TODO here
-    all_neighbor_params = cdf_roll[['Name','Season', 'PA_next', 'PA'] + list(set(latent_columns + target_columns)) ]
+    all_neighbor_params = cdf_roll[['Name','IDfg', 'Season', 'PA_next', 'PA'] + list(set(latent_columns + target_columns)) ]
     all_neighbor_params = all_neighbor_params[all_neighbor_params.Season==season]
     
     
     for column in latent_columns:
         all_neighbors[f'delta_{column}_forward'] = all_neighbors[f'{column}_next'] - all_neighbors[column]
         
-        #TODO here
         sub_params = (
-            all_neighbors.groupby(['comparison_player','comparison_season'])
+            all_neighbors.groupby(['comparison_IDfg','comparison_season'])
                          .apply(fit_skew_agg, column = column).reset_index()
-                         .rename(columns={'comparison_player':'Name','comparison_season':'Season'})
+                         .rename(columns={'comparison_IDfg':'IDfg','comparison_season':'Season'})
         )
         
         
-        #TODO here
         all_neighbor_params = all_neighbor_params.merge(
             sub_params,
-            how='left', on=['Name','Season'])
+            how='left', on=['IDfg','Season'])
 
     all_neighbor_params = all_neighbor_params.dropna(subset=['loc_chase_value'])
 
@@ -126,8 +127,8 @@ def project_batters(season, weights, n_neighbors=400, n_seaon_lookback=3, tau=0.
     '''
 
     all_neighbors = all_neighbors.merge(all_neighbor_params\
-                                        .rename(columns={'Name':'comparison_player','Season':'comparison_season'}),
-                                       how = 'left', on = ['comparison_player','comparison_season']
+                                        .rename(columns={'IDfg':'comparison_IDfg','Season':'comparison_season'}),
+                                       how = 'left', on = ['comparison_IDfg','comparison_season']
                                        )
     
     for col in latent_columns:
@@ -143,48 +144,31 @@ def project_batters(season, weights, n_neighbors=400, n_seaon_lookback=3, tau=0.
     copula_corr = z_data.corr()
     u_samples = sample_joint_copula(copula_corr, latent_columns, n_samples)
     
+    output_df = invert_skewnorm_joint_samples(all_neighbor_params, u_samples, latent_columns)
     
-    if predict_delta == True:
+    
+    # commenting out because I would prefer to ue samples from dist as predictions.
+    # might use a model to calibrate but depends on accuracy - complexity tradeoff.
+    '''
+    with open('fences/xgb_woba.pkl', 'rb') as f:
+        d = pickle.load(f)
+        xgb = d['model']
+        output_columns = d['target_columns']
+        feature_columns = d['feature_columns']
 
-        with open('fences/xgb_woba_delta.pkl', 'rb') as f:
-            d = pickle.load(f)
-            xgb = d['model']
-            output_columns = d['target_columns']
-            feature_columns = d['feature_columns']
-            
-        feature_columns = [f'{col}_forward' for col in feature_columns]
-        samples = invert_skewnorm_joint_samples(all_neighbor_params, u_samples, latent_columns)
-        preds = predict_xgb(samples, xgb, feature_columns, output_columns)
-
-        # TODO here
-        all_neighbor_params = all_neighbor_params.merge(
-            preds[['Name','Season'] + output_columns],
-            how = 'left', on = ['Name','Season'])
-
-        all_neighbor_params[target_columns] = all_neighbor_params[target_columns].values + \
-            preds[output_columns].values
-        
-        output_df = all_neighbor_params
-    else:
-        with open('fences/xgb_woba.pkl', 'rb') as f:
-            d = pickle.load(f)
-            xgb = d['model']
-            output_columns = d['target_columns']
-            feature_columns = d['feature_columns']
-            
-        xgb_columns = latent_columns
-        samples = invert_skewnorm_joint_samples(all_neighbor_params, u_samples, latent_columns)
-        preds = predict_xgb(samples, xgb, feature_columns, output_columns)
-        output_df = preds
-        
-        
-    #TODO here
+    xgb_columns = latent_columns
+    samples = invert_skewnorm_joint_samples(all_neighbor_params, u_samples, latent_columns)
+    preds = predict_xgb(samples, xgb, feature_columns, output_columns)
+    output_df = preds
+    '''
+    
     return output_df
 
 if __name__ == '__main__':
     
     PREDICT_DELTA = False
-    sample_df = project_batters(season = 2023, weights=  [.72,.14,.14], n_seaon_lookback=3,
+    season = 2024
+    sample_df = project_batters(season = season, weights=  [.72,.14,.14], n_seaon_lookback=3,
                                 n_neighbors = 400, tau=16, predict_delta = PREDICT_DELTA)
     
-    #sample_df.to_csv('samples.csv')
+    sample_df.to_csv(f'samples_{season}.csv')
